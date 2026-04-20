@@ -3,9 +3,9 @@
  */
 
 import NDK, { type NDKEvent, type NDKSubscription, zapInvoiceFromEvent } from '@nostr-dev-kit/ndk';
-import type { DownloadRequest, InvoiceStore, ZapReceipt } from './types';
-import { collectEvents } from './gallery';
-import { KIND_ZAP_RECEIPT } from './kinds';
+import type { DownloadRequest, InvoiceStore, ZapReceipt } from './types.js';
+import { collectEvents } from './gallery.js';
+import { KIND_ZAP_RECEIPT } from './kinds.js';
 
 const ZAP_FETCH_TIMEOUT_MS = 8000;
 

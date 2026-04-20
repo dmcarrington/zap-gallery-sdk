@@ -3,8 +3,8 @@
  */
 
 import NDK, { NDKEvent, NDKSubscription } from '@nostr-dev-kit/ndk';
-import type { GalleryImage, GalleryConfig } from './types';
-import { KIND_IMAGE_LISTING } from './kinds';
+import type { GalleryImage, GalleryConfig } from './types.js';
+import { KIND_IMAGE_LISTING } from './kinds.js';
 
 const DEFAULT_FETCH_TIMEOUT_MS = 5000;
 

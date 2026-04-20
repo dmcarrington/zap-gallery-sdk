@@ -13,8 +13,8 @@
  * @module zap-gallery-sdk
  */
 
-export * from './gallery';
-export * from './payment';
-export * from './image';
-export * from './types';
-export * from './kinds';
+export * from './gallery.js';
+export * from './payment.js';
+export * from './image.js';
+export * from './types.js';
+export * from './kinds.js';

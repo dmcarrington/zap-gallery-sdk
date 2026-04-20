@@ -3,9 +3,9 @@
  */
 
 import NDK, { NDKEvent, NDKUser, NDKPrivateKeySigner, type NDKSigner } from '@nostr-dev-kit/ndk';
-import type { GalleryConfig, DownloadResponse } from './types';
-import { collectEvents } from './gallery';
-import { KIND_APP_DATA, KIND_IMAGE_LISTING, KIND_ENCRYPTED_DM } from './kinds';
+import type { GalleryConfig, DownloadResponse } from './types.js';
+import { collectEvents } from './gallery.js';
+import { KIND_APP_DATA, KIND_IMAGE_LISTING, KIND_ENCRYPTED_DM } from './kinds.js';
 
 export interface ZapImageSDKInjection {
 	ndk: NDK;

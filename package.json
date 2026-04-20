@@ -1,6 +1,6 @@
 {
 	"name": "zap-gallery-sdk",
-	"version": "0.2.0",
+	"version": "0.2.1",
 	"description": "SDK for integrating with Nostr Zap Gallery — monetize images via Lightning zaps",
 	"main": "dist/index.js",
 	"types": "dist/index.d.ts",
@@ -24,7 +24,7 @@
 		"gallery",
 		"blossom"
 	],
-	"author": "David Carrington <david@cheshireremnant.com>",
+	"author": "David Carrington dmcarrington@protonmail.com>",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
