@@ -2,10 +2,18 @@
  * Image operations — download URLs, decryption, DM delivery
  */
 
-import NDK, { NDKEvent, NDKUser, NDKPrivateKeySigner, type NDK } from '@nostr-dev-kit/ndk';
-import { nip04 } from 'nostr-tools';
+import NDK, { NDKEvent, NDKUser, NDKPrivateKeySigner, type NDKSigner } from '@nostr-dev-kit/ndk';
 import type { GalleryConfig, DownloadResponse } from './types';
-import { KIND_APP_DATA } from './kinds';
+import { collectEvents } from './gallery';
+import { KIND_APP_DATA, KIND_IMAGE_LISTING, KIND_ENCRYPTED_DM } from './kinds';
+
+export interface ZapImageSDKInjection {
+	ndk: NDK;
+	signer: NDKSigner;
+	ownerPubkey: string;
+}
+
+const IMAGE_URL_TIMEOUT_MS = 8000;
 
 /**
  * Image SDK — retrieve full-res URLs after payment verification
@@ -13,59 +21,66 @@ import { KIND_APP_DATA } from './kinds';
 export class ZapImageSDK {
 	private ndk: NDK;
 	private ownerPubkey: string;
-	private signer: NDKPrivateKeySigner | null;
+	private signer: NDKSigner | null;
+	private ownsNdk: boolean;
 
+	/**
+	 * Construct from a bare config (builds its own NDK) or from an existing
+	 * NDK + signer pair (use `ZapImageSDK.fromNdk` for that form).
+	 */
 	constructor(config: GalleryConfig, ownerNsec?: string) {
 		this.ownerPubkey = config.galleryOwnerPubkey;
-		this.ndk = new NDK({
-			explicitRelayUrls: config.relayUrls
-		});
-
-		if (ownerNsec) {
-			this.signer = new NDKPrivateKeySigner(ownerNsec);
-		} else {
-			this.signer = null;
-		}
+		this.ndk = new NDK({ explicitRelayUrls: config.relays });
+		this.signer = ownerNsec ? new NDKPrivateKeySigner(ownerNsec) : null;
+		this.ownsNdk = true;
 	}
 
 	/**
-	 * Connect to relays
+	 * Build a ZapImageSDK that reuses an existing NDK instance and signer.
+	 * Useful on servers that already maintain a shared NDK connection pool.
+	 */
+	static fromNdk(injection: ZapImageSDKInjection): ZapImageSDK {
+		const instance = Object.create(ZapImageSDK.prototype) as ZapImageSDK;
+		(instance as unknown as { ndk: NDK }).ndk = injection.ndk;
+		(instance as unknown as { ownerPubkey: string }).ownerPubkey = injection.ownerPubkey;
+		(instance as unknown as { signer: NDKSigner | null }).signer = injection.signer;
+		(instance as unknown as { ownsNdk: boolean }).ownsNdk = false;
+		return instance;
+	}
+
+	/**
+	 * Connect to relays. No-op when the SDK was built from an external NDK.
 	 */
 	async connect(): Promise<void> {
+		if (!this.ownsNdk) return;
 		await this.ndk.connect();
 	}
 
 	/**
-	 * Disconnect from relays
+	 * Disconnect from relays. No-op when the SDK was built from an external NDK.
 	 */
 	async disconnect(): Promise<void> {
-		this.ndk.pool.disconnect();
+		if (!this.ownsNdk) return;
+		for (const relay of this.ndk.pool.relays.values()) {
+			relay.disconnect();
+		}
 	}
 
 	/**
-	 * Get full-res image URL after verifying payment
-	 * This is typically called by your API endpoint after verifying the zap
+	 * Get full-res image URL after verifying payment. Callers should perform
+	 * the zap/invoice verification before invoking this method.
 	 */
-	async getFullResUrl(
-		buyerPubkey: string,
-		slug: string,
-		imageEventId: string,
-		requiredSats: number
-	): Promise<DownloadResponse> {
-		// Step 1: Verify payment (this would be done before calling this method)
-		// Step 2: Fetch encrypted image URL from kind 30078
-		const urlData = await this.fetchEncryptedImageUrl(slug);
-		if (!urlData) {
+	async getFullResUrl(buyerPubkey: string, slug: string): Promise<DownloadResponse> {
+		const event = await this.fetchEncryptedUrlEvent(slug);
+		if (!event) {
 			throw new Error('Image URL not found');
 		}
 
-		// Step 3: Decrypt the URL
-		const decrypted = this.decryptUrl(urlData);
+		const decrypted = await this.decryptUrlEvent(event);
 		if (!decrypted) {
 			throw new Error('Failed to decrypt image URL');
 		}
 
-		// Step 4: Send decryption key to buyer via NIP-04 DM (optional)
 		if (this.signer) {
 			void this.sendDmToBuyer(buyerPubkey, decrypted);
 		}
@@ -74,64 +89,113 @@ export class ZapImageSDK {
 	}
 
 	/**
-	 * Fetch encrypted image URL from kind 30078 events
+	 * Create a kind 30024 image listing event (public metadata).
 	 */
-	private async fetchEncryptedImageUrl(slug: string): Promise<DownloadResponse | null> {
-		const events = await this.ndk.fetchEvents(
+	createImageEvent(
+		slug: string,
+		title: string,
+		description: string,
+		priceSats: number,
+		thumbnailUrl: string,
+		fullResUrl: string,
+		mimeType: string = 'image/jpeg'
+	): NDKEvent {
+		const event = new NDKEvent(this.ndk);
+		event.kind = KIND_IMAGE_LISTING;
+		event.content = description;
+		event.tags = [
+			['d', slug],
+			['title', title],
+			['price', priceSats.toString()],
+			['thumb', thumbnailUrl],
+			['full_res_url', fullResUrl],
+			['m', mimeType]
+		];
+		return event;
+	}
+
+	/**
+	 * Create a kind 30078 event that carries the NIP-04-encrypted full-res URL
+	 * for `slug`. The payload is encrypted to the gallery owner so only the
+	 * owner's signer can unlock it later. Returns a signed event ready to
+	 * publish.
+	 */
+	async createImageUrlEvent(
+		slug: string,
+		payload: { url: string; mimeType?: string }
+	): Promise<NDKEvent> {
+		if (!this.signer) {
+			throw new Error('Signer not provided — cannot create encrypted URL event');
+		}
+
+		const owner = new NDKUser({ pubkey: this.ownerPubkey });
+		owner.ndk = this.ndk;
+
+		const body = JSON.stringify({
+			url: payload.url,
+			mimeType: payload.mimeType ?? 'image/jpeg'
+		});
+
+		const ciphertext = await this.signer.encrypt(owner, body, 'nip04');
+
+		const event = new NDKEvent(this.ndk);
+		event.kind = KIND_APP_DATA;
+		event.content = ciphertext;
+		event.tags = [
+			['d', `zap-gallery-url:${slug}`],
+			['m', payload.mimeType ?? 'image/jpeg']
+		];
+
+		await event.sign(this.signer);
+		return event;
+	}
+
+	private async fetchEncryptedUrlEvent(slug: string): Promise<NDKEvent | null> {
+		const events = await collectEvents(
+			this.ndk,
 			{
 				kinds: [KIND_APP_DATA],
 				authors: [this.ownerPubkey],
 				'#d': [`zap-gallery-url:${slug}`]
 			},
-			undefined,
-			8000  // 8s timeout
+			IMAGE_URL_TIMEOUT_MS
 		);
-
-		const event = Array.from(events)[0];
-		if (!event) return null;
-
-		return {
-			url: event.content,  // Will be decrypted
-			mimeType: this.getMimeType(event)
-		};
+		// Parameterized replaceable events: pick the most recent.
+		let latest: NDKEvent | null = null;
+		for (const event of events) {
+			if (!latest || (event.created_at ?? 0) > (latest.created_at ?? 0)) {
+				latest = event;
+			}
+		}
+		return latest;
 	}
 
-	/**
-	 * Decrypt image URL
-	 */
-	private decryptUrl(event: NDKEvent): DownloadResponse | null {
+	private async decryptUrlEvent(event: NDKEvent): Promise<DownloadResponse | null> {
 		if (!this.signer) {
-			throw new Error('Owner private key (nsec) not provided — cannot decrypt');
+			throw new Error('Signer not provided — cannot decrypt');
 		}
 
 		try {
 			const ownerUser = new NDKUser({ pubkey: this.ownerPubkey });
 			ownerUser.ndk = this.ndk;
 
-			const decrypted = this.signer.decrypt(ownerUser, event.content, 'nip04');
+			const decrypted = await this.signer.decrypt(ownerUser, event.content, 'nip04');
 			const data = JSON.parse(decrypted);
 
 			return {
 				url: data.url,
-				mimeType: data.mimeType || 'image/jpeg'
+				mimeType: data.mimeType || this.getMimeType(event)
 			};
-		} catch (err) {
+		} catch {
 			return null;
 		}
 	}
 
-	/**
-	 * Get MIME type from event tags
-	 */
 	private getMimeType(event: NDKEvent): string {
 		const mimeTypeTag = event.tags.find((t) => t[0] === 'm');
 		return mimeTypeTag?.[1] ?? 'image/jpeg';
 	}
 
-	/**
-	 * Send NIP-04 encrypted DM to buyer with decryption key
-	 * Fire-and-forget (doesn't await)
-	 */
 	private async sendDmToBuyer(buyerPubkey: string, urlData: DownloadResponse): Promise<void> {
 		if (!this.signer) return;
 
@@ -147,41 +211,14 @@ export class ZapImageSDK {
 			const encrypted = await this.signer.encrypt(buyerUser, payload, 'nip04');
 
 			const event = new NDKEvent(this.ndk);
-			event.kind = 4;  // NIP-04 encrypted DM
+			event.kind = KIND_ENCRYPTED_DM;
 			event.content = encrypted;
 			event.tags = [['p', buyerPubkey]];
 
+			await event.sign(this.signer);
 			await event.publish();
 		} catch (err) {
-			// Silently fail — DM delivery is best-effort
 			console.warn('[ZapImageSDK] Failed to send DM to buyer:', err);
 		}
-	}
-
-	/**
-	 * Create an encrypted image listing event (for upload)
-	 */
-	createImageEvent(
-		slug: string,
-		title: string,
-		description: string,
-		priceSats: number,
-		thumbnailUrl: string,
-		fullResUrl: string,
-		mimeType: string = 'image/jpeg'
-	): NDKEvent {
-		const event = new NDKEvent(this.ndk);
-		event.kind = 30024;  // KIND_IMAGE_LISTING
-		event.content = description;
-		event.tags = [
-			['d', slug],
-			['title', title],
-			['price', priceSats.toString()],
-			['thumb', thumbnailUrl],
-			['full_res_url', fullResUrl],
-			['m', mimeType]
-		];
-
-		return event;
 	}
 }

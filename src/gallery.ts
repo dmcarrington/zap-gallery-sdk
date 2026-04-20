@@ -2,9 +2,11 @@
  * Gallery SDK — fetch images, check payment status, retrieve URLs
  */
 
-import NDK, { NDKEvent, type NDKUser } from '@nostr-dev-kit/ndk';
-import type { GalleryImage, GalleryConfig, SDKOptions } from './types';
+import NDK, { NDKEvent, NDKSubscription } from '@nostr-dev-kit/ndk';
+import type { GalleryImage, GalleryConfig } from './types';
 import { KIND_IMAGE_LISTING } from './kinds';
+
+const DEFAULT_FETCH_TIMEOUT_MS = 5000;
 
 /**
  * Main gallery SDK class
@@ -13,20 +15,17 @@ export class ZapGallerySDK {
 	private ndk: NDK;
 	private ownerPubkey: string;
 	private relays: string[];
-	private pollIntervalMs: number;
 
 	private _images: GalleryImage[] = [];
 	private _loading = true;
-	private _subscription: any = null;  // Store subscription for cleanup
+	private _subscription: NDKSubscription | null = null;
 
-	constructor(config: GalleryConfig, options: SDKOptions = {}) {
+	constructor(config: GalleryConfig) {
 		this.ownerPubkey = config.galleryOwnerPubkey;
-		this.relays = config.relayUrls;
-		this.pollIntervalMs = config.relayPollIntervalMs ?? 5000;
+		this.relays = config.relays;
 
 		this.ndk = new NDK({
-			explicitRelayUrls: this.relays,
-			enableOutgoingRelayMessages: false
+			explicitRelayUrls: this.relays
 		});
 	}
 
@@ -34,7 +33,7 @@ export class ZapGallerySDK {
 	 * Connect to Nostr relays
 	 */
 	async connect(): Promise<void> {
-		if (this.ndk.pool.connectedRelays.size > 0) return;
+		if (this.ndk.pool.connectedRelays().length > 0) return;
 		await this.ndk.connect();
 	}
 
@@ -46,7 +45,9 @@ export class ZapGallerySDK {
 			this._subscription.stop();
 			this._subscription = null;
 		}
-		this.ndk.pool.disconnect();
+		for (const relay of this.ndk.pool.relays.values()) {
+			relay.disconnect();
+		}
 	}
 
 	/**
@@ -108,18 +109,17 @@ export class ZapGallerySDK {
 	}
 
 	/**
-	 * Manually refresh images (polling fallback)
+	 * Manually refresh images using a raw subscription with a hard timeout.
+	 * Resolves after `timeoutMs` with whatever events arrived, rather than
+	 * waiting for EOSE from a majority of relays.
 	 */
-	async refreshImages(): Promise<GalleryImage[]> {
+	async refreshImages(timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS): Promise<GalleryImage[]> {
 		if (!this.ownerPubkey) return [];
 
-		const events = await this.ndk.fetchEvents(
-			{
-				kinds: [KIND_IMAGE_LISTING],
-				authors: [this.ownerPubkey]
-			},
-			undefined,
-			5000  // 5s timeout
+		const events = await collectEvents(
+			this.ndk,
+			{ kinds: [KIND_IMAGE_LISTING], authors: [this.ownerPubkey] },
+			timeoutMs
 		);
 
 		const imageMap = new Map<string, GalleryImage>();
@@ -194,8 +194,37 @@ export function parseImageEvent(event: NDKEvent): GalleryImage | null {
 }
 
 /**
- * Get tag value by name
+ * Run a NDK subscription and resolve after a hard timeout with whatever
+ * events arrived. A single slow relay cannot stall the promise.
  */
+export function collectEvents(
+	ndk: NDK,
+	filter: Parameters<NDK['subscribe']>[0],
+	timeoutMs: number
+): Promise<NDKEvent[]> {
+	return new Promise((resolve) => {
+		const events = new Map<string, NDKEvent>();
+		const sub = ndk.subscribe(filter, { closeOnEose: false });
+
+		let done = false;
+		const finish = () => {
+			if (done) return;
+			done = true;
+			sub.stop();
+			resolve(Array.from(events.values()));
+		};
+
+		sub.on('event', (event: NDKEvent) => {
+			events.set(event.id, event);
+		});
+		sub.on('eose', () => {
+			finish();
+		});
+
+		setTimeout(finish, timeoutMs);
+	});
+}
+
 function getTagValue(event: NDKEvent, tagName: string): string | undefined {
 	const tag = event.tags.find(([t]) => t === tagName);
 	return tag?.[1];

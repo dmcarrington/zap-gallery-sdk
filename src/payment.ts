@@ -1,11 +1,13 @@
 /**
- * Payment SDK — create invoices, check payment status, verify zaps
+ * Payment SDK — verify zap payments against relays or an injected invoice store
  */
 
-import NDK, { type NDKEvent } from '@nostr-dev-kit/ndk';
-import { Kind } from 'nostr-tools';
-import type { Invoice, DownloadRequest, DownloadResponse, ZapReceipt } from './types';
+import NDK, { type NDKEvent, type NDKSubscription, zapInvoiceFromEvent } from '@nostr-dev-kit/ndk';
+import type { DownloadRequest, InvoiceStore, ZapReceipt } from './types';
+import { collectEvents } from './gallery';
 import { KIND_ZAP_RECEIPT } from './kinds';
+
+const ZAP_FETCH_TIMEOUT_MS = 8000;
 
 /**
  * Payment status enumeration
@@ -27,40 +29,46 @@ export interface PaymentResult {
 	minRequiredSats: number;
 }
 
+export interface ZapPaymentSDKOptions {
+	invoiceStore?: InvoiceStore;
+	fetchTimeoutMs?: number;
+}
+
 /**
  * Main payment SDK class
  */
 export class ZapPaymentSDK {
 	private ndk: NDK;
 	private ownerPubkey: string;
+	private invoiceStore?: InvoiceStore;
+	private fetchTimeoutMs: number;
 
-	constructor(ndk: NDK, ownerPubkey: string) {
+	constructor(ndk: NDK, ownerPubkey: string, options: ZapPaymentSDKOptions = {}) {
 		this.ndk = ndk;
 		this.ownerPubkey = ownerPubkey;
+		this.invoiceStore = options.invoiceStore;
+		this.fetchTimeoutMs = options.fetchTimeoutMs ?? ZAP_FETCH_TIMEOUT_MS;
 	}
 
 	/**
-	 * Check if an image has been paid for
-	 * Tries multiple verification methods:
-	 * 1. Server-side invoice store (fastest)
-	 * 2. Zap receipts on relays (fallback)
+	 * Check if an image has been paid for. Consults the injected invoice
+	 * store first (if any) and falls back to zap receipts on relays.
 	 */
 	async verifyPayment(request: DownloadRequest): Promise<PaymentResult> {
-		// Method 1: Check invoice store (if server-side)
-		const invoiceStoreResult = await this.checkInvoiceStore(request);
-		if (invoiceStoreResult.status === PaymentStatus.PAID) {
-			return invoiceStoreResult;
+		if (this.invoiceStore) {
+			const paid = await this.invoiceStore.hasPaidInvoice(request.slug, request.buyerPubkey);
+			if (paid) {
+				return {
+					status: PaymentStatus.PAID,
+					amountSats: request.priceSats,
+					minRequiredSats: request.priceSats
+				};
+			}
 		}
 
-		// Method 2: Check zap receipts on relays
 		const zapResult = await this.checkZapReceipts(request);
-		if (zapResult.status === PaymentStatus.PAID) {
-			return zapResult;
-		}
-
-		if (zapResult.status === PaymentStatus.PARTIALLY_PAID) {
-			return zapResult;
-		}
+		if (zapResult.status === PaymentStatus.PAID) return zapResult;
+		if (zapResult.status === PaymentStatus.PARTIALLY_PAID) return zapResult;
 
 		return {
 			status: PaymentStatus.NOT_FOUND,
@@ -70,64 +78,35 @@ export class ZapPaymentSDK {
 	}
 
 	/**
-	 * Check server-side invoice store (your app should implement this)
-	 */
-	protected async checkInvoiceStore(
-		request: DownloadRequest
-	): Promise<PaymentResult> {
-		// This would typically query your database
-		// Implementation depends on your backend:
-		// - Look up by paymentHash + slug + buyerPubkey
-		// - Check if paid=true
-		// - Return amount from record
-		// This is a stub — override in your implementation
-		return {
-			status: PaymentStatus.NOT_FOUND,
-			amountSats: 0,
-			minRequiredSats: request.priceSats
-		};
-	}
-
-	/**
-	 * Query Zap Receipts (kind 9735) from relays
+	 * Query Zap Receipts (kind 9735) from relays and match against the
+	 * image, buyer, and gallery owner. Uses NDK's `zapInvoiceFromEvent` so
+	 * the amount is taken from the bolt11 invoice rather than from the
+	 * zap-request's requested amount.
 	 */
 	async checkZapReceipts(request: DownloadRequest): Promise<PaymentResult> {
-		const zapReceipts = await this.ndk.fetchEvents(
-			{
-				kinds: [KIND_ZAP_RECEIPT],
-				'#e': [request.imageEventId]
-			},
-			undefined,
-			8000  // 8s timeout
+		const receipts = await collectEvents(
+			this.ndk,
+			{ kinds: [KIND_ZAP_RECEIPT], '#e': [request.imageEventId] },
+			this.fetchTimeoutMs
 		);
 
 		let maxAmountSats = 0;
 		let foundPayment = false;
 
-		for (const receipt of zapReceipts) {
-			const descTag = receipt.tags.find((t) => t[0] === 'description');
-			if (!descTag?.[1]) continue;
+		for (const receipt of receipts) {
+			const invoice = zapInvoiceFromEvent(receipt);
+			if (!invoice) continue;
 
-			try {
-				const zapRequest = JSON.parse(descTag[1]);
-				const senderPubkey = zapRequest.pubkey;
+			if (invoice.zappee !== request.buyerPubkey) continue;
+			if (invoice.zapped !== this.ownerPubkey) continue;
+			if (invoice.zappedEvent && invoice.zappedEvent !== request.imageEventId) continue;
 
-				// Check if this is from our buyer
-				if (senderPubkey !== request.buyerPubkey) continue;
+			const amountSats = Math.floor(invoice.amount / 1000);
+			maxAmountSats = Math.max(maxAmountSats, amountSats);
 
-				const amountTag = zapRequest.tags?.find((t: string[]) => t[0] === 'amount');
-				const amountMsats = amountTag ? parseInt(amountTag[1], 10) : 0;
-				const amountSats = Math.floor(amountMsats / 1000);
-
-				if (amountSats >= request.priceSats) {
-					foundPayment = true;
-					maxAmountSats = Math.max(maxAmountSats, amountSats);
-					break;  // Found a valid payment, stop searching
-				}
-
-				maxAmountSats = Math.max(maxAmountSats, amountSats);
-			} catch {
-				continue;
+			if (amountSats >= request.priceSats) {
+				foundPayment = true;
+				break;
 			}
 		}
 
@@ -155,25 +134,44 @@ export class ZapPaymentSDK {
 	}
 
 	/**
-	 * Extract ZapReceipt from a kind 9735 event
+	 * Subscribe to zap receipts for a specific image event. Invokes
+	 * `onReceipt` for every valid receipt (amount authoritative, recipient =
+	 * gallery owner). Returns a cleanup function that stops the subscription.
+	 */
+	subscribeZapReceipts(
+		imageEventId: string,
+		onReceipt: (receipt: ZapReceipt) => void
+	): () => void {
+		const sub: NDKSubscription = this.ndk.subscribe(
+			{ kinds: [KIND_ZAP_RECEIPT], '#e': [imageEventId] },
+			{ closeOnEose: false }
+		);
+
+		sub.on('event', (event: NDKEvent) => {
+			const receipt = this.extractZapReceipt(event);
+			if (!receipt) return;
+			if (receipt.recipientPubkey !== this.ownerPubkey) return;
+			if (receipt.zappedEventId && receipt.zappedEventId !== imageEventId) return;
+			onReceipt(receipt);
+		});
+
+		return () => sub.stop();
+	}
+
+	/**
+	 * Extract a ZapReceipt from a kind 9735 event. Returns null if the
+	 * event cannot be parsed into a valid invoice.
 	 */
 	extractZapReceipt(event: NDKEvent): ZapReceipt | null {
-		const descTag = event.tags.find((t) => t[0] === 'description');
-		if (!descTag?.[1]) return null;
+		const invoice = zapInvoiceFromEvent(event);
+		if (!invoice) return null;
 
-		try {
-			const zapRequest = JSON.parse(descTag[1]);
-			const senderPubkey = zapRequest.pubkey;
-			const amountTag = zapRequest.tags?.find((t: string[]) => t[0] === 'amount');
-			const amountMsats = amountTag ? parseInt(amountTag[1], 10) : 0;
-
-			return {
-				senderPubkey,
-				amountSats: Math.floor(amountMsats / 1000),
-				description: descTag[1]
-			};
-		} catch {
-			return null;
-		}
+		return {
+			senderPubkey: invoice.zappee,
+			recipientPubkey: invoice.zapped,
+			amountSats: Math.floor(invoice.amount / 1000),
+			zappedEventId: invoice.zappedEvent,
+			description: invoice.comment
+		};
 	}
 }

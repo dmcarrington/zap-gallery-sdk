@@ -2,8 +2,6 @@
  * Types and interfaces for Zap Gallery
  */
 
-import type { NDKEvent as NDKEventType } from '@nostr-dev-kit/ndk';
-
 /**
  * Gallery image metadata as stored on Nostr relays
  */
@@ -57,7 +55,9 @@ export interface DownloadResponse {
  */
 export interface ZapReceipt {
 	senderPubkey: string;
+	recipientPubkey: string;
 	amountSats: number;
+	zappedEventId?: string;
 	description?: string;
 }
 
@@ -84,21 +84,12 @@ export interface GalleryConfig {
 	galleryOwnerPubkey: string;
 	relays: string[];
 	blossom: BlossomConfig;
-	relayPollIntervalMs?: number;  // Default: 5000ms
 }
 
 /**
- * SDK options for initialization
+ * Pluggable server-side invoice store. Consumers implement this to
+ * short-circuit zap-receipt lookups with a trusted record of payment.
  */
-export interface SDKOptions {
-	// Your private key for signing (if you're the gallery owner)
-	ownerNsec?: string;
-	// Nostr Wallet Connect URI for Lightning payments (if using NWC)
-	nwcUri?: string;
-	// Custom relay URLs
-	relayUrls?: string[];
-	// Custom Blossom servers
-	blossomServers?: string[];
-	// Maximum file upload size in MB
-	maxUploadSizeMB?: number;
+export interface InvoiceStore {
+	hasPaidInvoice(slug: string, buyerPubkey: string): Promise<boolean>;
 }

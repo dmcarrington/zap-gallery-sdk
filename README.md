@@ -35,8 +35,6 @@ Peer runtime dependencies are declared in `package.json`:
 
 ## Installation
 
-From npm (once published):
-
 ```bash
 npm install zap-gallery-sdk
 ```
@@ -58,6 +56,7 @@ npm install /path/to/zap-gallery-sdk
 ## Quick start
 
 ```typescript
+import NDK from '@nostr-dev-kit/ndk';
 import {
   ZapGallerySDK,
   ZapPaymentSDK,
@@ -80,7 +79,10 @@ await gallery.connect();
 const images = await gallery.refreshImages();
 
 // 2. Verify a payment for one image
-const payment = new ZapPaymentSDK(gallery['ndk'], config.galleryOwnerPubkey);
+const ndk = new NDK({ explicitRelayUrls: config.relays });
+await ndk.connect();
+
+const payment = new ZapPaymentSDK(ndk, config.galleryOwnerPubkey);
 const result = await payment.verifyPayment({
   slug: images[0].slug,
   buyerPubkey: '<hex-pubkey-of-buyer>',
@@ -95,8 +97,6 @@ if (result.status === PaymentStatus.PAID) {
   const { url, mimeType } = await img.getFullResUrl(
     '<hex-pubkey-of-buyer>',
     images[0].slug,
-    images[0].eventId,
-    images[0].priceSats,
   );
   console.log('Unlocked:', url, mimeType);
 }
@@ -116,11 +116,21 @@ interface GalleryConfig {
     serverUrls: string[];           // Blossom media servers
     maxFileSizeMB: number;
   };
-  relayPollIntervalMs?: number;     // default 5000ms
 }
 ```
 
 `ZapImageSDK` additionally accepts an `nsec` (private key) so it can decrypt the full-resolution URL stored in an encrypted `kind:30078` event and optionally DM it to the buyer. **Keep this key server-side.**
+
+### Reusing an existing NDK
+
+Servers that already maintain an NDK connection pool should inject it rather than paying the double-connection cost:
+
+```typescript
+import { ZapImageSDK, ZapPaymentSDK } from 'zap-gallery-sdk';
+
+const img = ZapImageSDK.fromNdk({ ndk, signer, ownerPubkey });
+const payment = new ZapPaymentSDK(ndk, ownerPubkey);
+```
 
 ---
 
@@ -139,7 +149,7 @@ const unsubscribe = gallery.subscribe((images: GalleryImage[]) => {
   render(images); // your UI
 });
 
-// Or one-shot fetch
+// Or one-shot fetch (hard 5s timeout — resolves with whatever arrived)
 const snapshot = await gallery.refreshImages();
 
 // Helpers
@@ -164,7 +174,13 @@ import { ZapPaymentSDK, PaymentStatus } from 'zap-gallery-sdk';
 const ndk = new NDK({ explicitRelayUrls: config.relays });
 await ndk.connect();
 
-const payment = new ZapPaymentSDK(ndk, config.galleryOwnerPubkey);
+const payment = new ZapPaymentSDK(ndk, config.galleryOwnerPubkey, {
+  invoiceStore: {
+    async hasPaidInvoice(slug, buyerPubkey) {
+      return db.invoices.isPaid(slug, buyerPubkey);
+    },
+  },
+});
 
 const result = await payment.verifyPayment({
   slug,
@@ -187,7 +203,17 @@ switch (result.status) {
 }
 ```
 
-`verifyPayment` first consults an optional server-side invoice store (override `checkInvoiceStore` to plug in your DB) and falls back to querying `kind:9735` zap receipts from the configured relays.
+`verifyPayment` first consults the optional `invoiceStore` (inject your DB adapter) and falls back to querying `kind:9735` zap receipts. Zap receipts are validated using NDK's `zapInvoiceFromEvent`, which cross-checks the bolt11 invoice amount, and the receipt's `p` tag is required to match the gallery owner.
+
+#### Watching zap receipts in real time
+
+```typescript
+const unsubscribe = payment.subscribeZapReceipts(imageEventId, (receipt) => {
+  if (receipt.senderPubkey === buyerPubkey && receipt.amountSats >= priceSats) {
+    unlock();
+  }
+});
+```
 
 ### 3. Delivering the full-resolution URL
 
@@ -197,12 +223,7 @@ import { ZapImageSDK } from 'zap-gallery-sdk';
 const img = new ZapImageSDK(config, process.env.OWNER_NSEC);
 await img.connect();
 
-const { url, mimeType } = await img.getFullResUrl(
-  buyerPubkey,
-  slug,
-  imageEventId,
-  priceSats,
-);
+const { url, mimeType } = await img.getFullResUrl(buyerPubkey, slug);
 // Return `url` to the authenticated buyer.
 // Optionally, the SDK fires off a NIP-04 DM to the buyer with the same payload.
 ```
@@ -215,21 +236,28 @@ import { ZapImageSDK } from 'zap-gallery-sdk';
 const img = new ZapImageSDK(config, process.env.OWNER_NSEC);
 await img.connect();
 
-const event = img.createImageEvent(
+// Public listing (kind 30024)
+const listing = img.createImageEvent(
   'sunset-01',                       // slug (d-tag)
   'Sunset over the estuary',         // title
   'Shot on a cold morning in March', // description
   2100,                              // price in sats
   'https://blossom.example/thumb',   // public thumbnail URL
-  'https://blossom.example/full',    // private full-res URL
+  'https://blossom.example/full',    // private full-res URL (placeholder)
   'image/jpeg',
 );
+await listing.sign();
+await listing.publish();
 
-await event.sign();
-await event.publish();
+// Encrypted URL record (kind 30078) — NIP-04 encrypted to the owner
+const urlEvent = await img.createImageUrlEvent('sunset-01', {
+  url: 'https://blossom.example/full',
+  mimeType: 'image/jpeg',
+});
+await urlEvent.publish();
 ```
 
-The full-res URL should be stored encrypted in a companion `kind:30078` event (`d`-tag `zap-gallery-url:<slug>`); `ZapImageSDK.getFullResUrl` reads and decrypts it.
+`ZapImageSDK.getFullResUrl` reads and decrypts the `kind:30078` companion event with `d`-tag `zap-gallery-url:<slug>`.
 
 ---
 
